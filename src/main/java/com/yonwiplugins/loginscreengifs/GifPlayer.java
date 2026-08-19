@@ -102,12 +102,12 @@ class GifPlayer
 			return;
 		}
 
-		int decodedInFirstPass = 0;
-		while (running)
+		try
 		{
-			int decoded = 0;
-			try
+			boolean firstPass = true;
+			while (running)
 			{
+				int decoded = 0;
 				// Each frame is held back one step, because whether a frame ends the loop is
 				// only knowable once the following read comes back empty.
 				Frame pending = null;
@@ -131,28 +131,31 @@ class GifPlayer
 				{
 					return;
 				}
-			}
-			catch (IOException | RuntimeException ex)
-			{
-				if (running)
-				{
-					log.warn("Could not decode GIF {}", file, ex);
-				}
-				return;
-			}
 
-			if (decodedInFirstPass == 0)
-			{
-				decodedInFirstPass = decoded;
-				if (decoded == 0)
+				if (firstPass)
 				{
-					log.warn("GIF has no readable frames: {}", file);
-					return;
+					firstPass = false;
+					if (decoded == 0)
+					{
+						log.warn("GIF has no readable frames: {}", file);
+						return;
+					}
+					log.debug("Playing {} ({} frames)", file.getName(), decoded);
 				}
-				log.debug("Playing {} ({} frames)", file.getName(), decoded);
-			}
 
-			gif.rewind();
+				gif.rewind();
+			}
+		}
+		catch (IOException | RuntimeException ex)
+		{
+			if (running)
+			{
+				log.warn("Could not decode GIF {}", file, ex);
+			}
+		}
+		finally
+		{
+			gif.close();
 		}
 	}
 

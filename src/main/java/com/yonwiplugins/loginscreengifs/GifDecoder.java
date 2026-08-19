@@ -1,11 +1,16 @@
 package com.yonwiplugins.loginscreengifs;
 
+import java.io.BufferedInputStream;
+import java.io.Closeable;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
-import java.nio.file.Files;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
- * A self-contained GIF reader.
+ * A self-contained, streaming GIF reader.
  *
  * <p>The JRE ships one, but it throws {@code ArrayIndexOutOfBoundsException: Index 4096 out of
  * bounds for length 4096} on a good number of perfectly valid GIFs — 4096 being the ceiling of
@@ -16,11 +21,18 @@ import java.nio.file.Files;
  *
  * <p>So the format is parsed here instead. The LZW loop below stops growing its table at the
  * ceiling rather than running past it, which is the whole of the difference.</p>
+ *
+ * <p>The file is read as a stream and never held in memory: a GIF is laid out strictly
+ * front to back, so nothing here needs to seek. Looping reopens the file rather than keeping
+ * tens of megabytes on the heap, and the only buffers that live between frames are the canvas
+ * and, when a GIF asks for it, one saved copy of the canvas.</p>
  */
-final class GifDecoder
+final class GifDecoder implements Closeable
 {
 	/** 2^12: an LZW code is at most 12 bits, so the dictionary cannot exceed this. */
 	private static final int MAX_STACK_SIZE = 4096;
+	private static final int READ_BUFFER_BYTES = 1 << 16;
+
 	private static final int DISPOSAL_RESTORE_BACKGROUND = 2;
 	private static final int DISPOSAL_RESTORE_PREVIOUS = 3;
 
@@ -29,14 +41,14 @@ final class GifDecoder
 	private static final int TRAILER = 0x3B;
 	private static final int GRAPHIC_CONTROL_LABEL = 0xF9;
 
-	private final byte[] data;
-	private int position;
+	private final File file;
+	private InputStream in;
+	private boolean endOfStream;
 
 	private int width;
 	private int height;
 	private int[] globalColorTable;
-	private int backgroundColour;
-	private int firstFramePosition;
+	private int backgroundColour = 0xFF000000;
 
 	// Compositing state, carried between frames.
 	private int[] canvas;
@@ -54,16 +66,23 @@ final class GifDecoder
 
 	private final byte[] block = new byte[256];
 
-	private GifDecoder(byte[] data)
+	private GifDecoder(File file)
 	{
-		this.data = data;
+		this.file = file;
 	}
 
 	static GifDecoder open(File file) throws IOException
 	{
-		byte[] bytes = Files.readAllBytes(file.toPath());
-		GifDecoder decoder = new GifDecoder(bytes);
-		decoder.readHeader();
+		GifDecoder decoder = new GifDecoder(file);
+		try
+		{
+			decoder.openStream();
+		}
+		catch (IOException | RuntimeException ex)
+		{
+			decoder.close();
+			throw ex;
+		}
 		return decoder;
 	}
 
@@ -77,25 +96,45 @@ final class GifDecoder
 		return height;
 	}
 
+	private void openStream() throws IOException
+	{
+		in = new BufferedInputStream(new FileInputStream(file), READ_BUFFER_BYTES);
+		endOfStream = false;
+		readHeader();
+	}
+
+	@Override
+	public void close()
+	{
+		if (in != null)
+		{
+			try
+			{
+				in.close();
+			}
+			catch (IOException ignored)
+			{
+				// Nothing useful to do when closing a read-only stream fails.
+			}
+			in = null;
+		}
+	}
+
 	private void readHeader() throws IOException
 	{
-		if (data.length < 13)
-		{
-			throw new IOException("Truncated GIF");
-		}
+		byte[] header = new byte[13];
+		readFully(header, header.length);
 
-		String signature = new String(data, 0, 6, java.nio.charset.StandardCharsets.US_ASCII);
+		String signature = new String(header, 0, 6, StandardCharsets.US_ASCII);
 		if (!"GIF87a".equals(signature) && !"GIF89a".equals(signature))
 		{
 			throw new IOException("Not a GIF: " + signature);
 		}
 
-		position = 6;
-		width = readShort();
-		height = readShort();
-		int packed = readByte();
-		int backgroundIndex = readByte();
-		readByte(); // pixel aspect ratio, unused
+		width = (header[6] & 0xFF) | ((header[7] & 0xFF) << 8);
+		height = (header[8] & 0xFF) | ((header[9] & 0xFF) << 8);
+		int packed = header[10] & 0xFF;
+		int backgroundIndex = header[11] & 0xFF;
 
 		if (width <= 0 || height <= 0)
 		{
@@ -109,25 +148,28 @@ final class GifDecoder
 				? globalColorTable[backgroundIndex]
 				: 0xFF000000;
 		}
-		else
-		{
-			backgroundColour = 0xFF000000;
-		}
 
-		firstFramePosition = position;
-		canvas = new int[width * height];
-		java.util.Arrays.fill(canvas, 0xFF000000);
+		if (canvas == null || canvas.length != width * height)
+		{
+			canvas = new int[width * height];
+		}
+		resetCompositing();
 	}
 
-	/** Restarts playback from the first frame without re-reading the file. */
-	void rewind()
+	private void resetCompositing()
 	{
-		position = firstFramePosition;
+		Arrays.fill(canvas, 0xFF000000);
 		pendingDisposal = 0;
 		transparentIndex = -1;
 		delayHundredths = 0;
 		disposalMethod = 0;
-		java.util.Arrays.fill(canvas, 0xFF000000);
+	}
+
+	/** Restarts playback from the first frame by reopening the file. */
+	void rewind() throws IOException
+	{
+		close();
+		openStream();
 	}
 
 	/**
@@ -135,11 +177,16 @@ final class GifDecoder
 	 *
 	 * @return the frame, or null once the GIF has no more
 	 */
-	Frame nextFrame() throws IOException
+	GifDecoder.Frame nextFrame() throws IOException
 	{
-		while (position < data.length)
+		while (!endOfStream)
 		{
 			int blockType = readByte();
+			if (endOfStream)
+			{
+				return null;
+			}
+
 			switch (blockType)
 			{
 				case IMAGE_SEPARATOR:
@@ -176,7 +223,7 @@ final class GifDecoder
 		}
 	}
 
-	private Frame readImage() throws IOException
+	private GifDecoder.Frame readImage() throws IOException
 	{
 		int left = readShort();
 		int top = readShort();
@@ -194,19 +241,17 @@ final class GifDecoder
 		{
 			throw new IOException("GIF frame has no colour table");
 		}
+		if (frameWidth <= 0 || frameHeight <= 0)
+		{
+			throw new IOException("GIF frame has no size: " + frameWidth + "x" + frameHeight);
+		}
 
 		// Apply the previous frame's disposal before drawing over it.
 		applyPendingDisposal();
 
 		byte[] indices = decodeImageData(frameWidth * frameHeight);
-		drawFrame(indices, colourTable, left, top, frameWidth, frameHeight, interlaced);
 
-		pendingDisposal = disposalMethod;
-		pendingLeft = left;
-		pendingTop = top;
-		pendingWidth = frameWidth;
-		pendingHeight = frameHeight;
-		if (pendingDisposal == DISPOSAL_RESTORE_PREVIOUS)
+		if (disposalMethod == DISPOSAL_RESTORE_PREVIOUS)
 		{
 			if (previousCanvas == null || previousCanvas.length != canvas.length)
 			{
@@ -215,7 +260,15 @@ final class GifDecoder
 			System.arraycopy(canvas, 0, previousCanvas, 0, canvas.length);
 		}
 
-		Frame frame = new Frame(canvas.clone(), GifPlayer.frameDuration(delayHundredths));
+		drawFrame(indices, colourTable, left, top, frameWidth, frameHeight, interlaced);
+
+		pendingDisposal = disposalMethod;
+		pendingLeft = left;
+		pendingTop = top;
+		pendingWidth = frameWidth;
+		pendingHeight = frameHeight;
+
+		GifDecoder.Frame frame = new GifDecoder.Frame(canvas.clone(), GifPlayer.frameDuration(delayHundredths));
 		// Defaults reset per frame; a GIF need not repeat the control extension.
 		transparentIndex = -1;
 		delayHundredths = 0;
@@ -284,7 +337,7 @@ final class GifDecoder
 	}
 
 	/** GIF interlacing stores rows in four passes. */
-	private static int interlacedRow(int row, int frameHeight)
+	static int interlacedRow(int row, int frameHeight)
 	{
 		int pass1 = (frameHeight + 7) / 8;
 		int pass2 = pass1 + (frameHeight + 3) / 8;
@@ -309,8 +362,8 @@ final class GifDecoder
 	 * LZW decompression.
 	 *
 	 * <p>The one guard the JRE decoder is missing is on {@code available}: once the dictionary
-	 * reaches 4096 entries it must stop growing and simply keep decoding with the table it has,
-	 * rather than writing past the end of it.</p>
+	 * reaches 4096 entries it must stop growing and keep decoding with the table it has, rather
+	 * than writing past the end of it.</p>
 	 */
 	private byte[] decodeImageData(int pixelCount) throws IOException
 	{
@@ -433,56 +486,101 @@ final class GifDecoder
 
 	private int[] readColorTable(int entries) throws IOException
 	{
-		if (position + entries * 3 > data.length)
-		{
-			throw new IOException("Truncated colour table");
-		}
+		byte[] raw = new byte[entries * 3];
+		readFully(raw, raw.length);
 
 		int[] table = new int[entries];
 		for (int entry = 0; entry < entries; entry++)
 		{
-			int red = data[position++] & 0xFF;
-			int green = data[position++] & 0xFF;
-			int blue = data[position++] & 0xFF;
-			table[entry] = 0xFF000000 | (red << 16) | (green << 8) | blue;
+			int offset = entry * 3;
+			table[entry] = 0xFF000000
+				| ((raw[offset] & 0xFF) << 16)
+				| ((raw[offset + 1] & 0xFF) << 8)
+				| (raw[offset + 2] & 0xFF);
 		}
 		return table;
 	}
 
 	/** Reads one sub-block into {@link #block}, returning its length. */
-	private int readSubBlock()
+	private int readSubBlock() throws IOException
 	{
-		if (position >= data.length)
+		int size = readByte();
+		if (endOfStream || size == 0)
 		{
 			return 0;
 		}
 
-		int size = data[position++] & 0xFF;
-		int available = Math.min(size, data.length - position);
-		System.arraycopy(data, position, block, 0, available);
-		position += available;
-		return available;
+		int read = 0;
+		while (read < size)
+		{
+			int count = in.read(block, read, size - read);
+			if (count < 0)
+			{
+				endOfStream = true;
+				break;
+			}
+			read += count;
+		}
+		return read;
 	}
 
-	private void skipSubBlocks()
+	private void skipSubBlocks() throws IOException
 	{
-		while (position < data.length)
+		while (!endOfStream)
 		{
-			int size = data[position++] & 0xFF;
-			if (size == 0)
+			int size = readByte();
+			if (endOfStream || size == 0)
 			{
 				return;
 			}
-			position = Math.min(data.length, position + size);
+
+			long remaining = size;
+			while (remaining > 0)
+			{
+				long skipped = in.skip(remaining);
+				if (skipped <= 0)
+				{
+					if (in.read() < 0)
+					{
+						endOfStream = true;
+						return;
+					}
+					remaining--;
+				}
+				else
+				{
+					remaining -= skipped;
+				}
+			}
 		}
 	}
 
-	private int readByte()
+	private void readFully(byte[] target, int length) throws IOException
 	{
-		return position < data.length ? data[position++] & 0xFF : 0;
+		int read = 0;
+		while (read < length)
+		{
+			int count = in.read(target, read, length - read);
+			if (count < 0)
+			{
+				throw new IOException("Truncated GIF: wanted " + length + " bytes, got " + read);
+			}
+			read += count;
+		}
 	}
 
-	private int readShort()
+	private int readByte() throws IOException
+	{
+		int value = in.read();
+		if (value < 0)
+		{
+			endOfStream = true;
+			return 0;
+		}
+		return value;
+	}
+
+	private int readShort() throws IOException
 	{
 		return readByte() | (readByte() << 8);
 	}
