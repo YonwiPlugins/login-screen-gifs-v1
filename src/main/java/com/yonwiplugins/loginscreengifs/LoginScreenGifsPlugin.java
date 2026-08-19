@@ -21,7 +21,6 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.BeforeRender;
-import net.runelite.api.events.GameStateChanged;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.events.ConfigChanged;
@@ -96,7 +95,7 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 	private volatile long holdUntilNanos;
 
 	private boolean backgroundApplied;
-	private boolean inLoginFlow;
+	private boolean loginScreenShowing;
 	private long nextFrameAtNanos;
 	private long cycleDueAtNanos;
 
@@ -154,7 +153,7 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 		}
 
 		stopDecoder();
-		inLoginFlow = false;
+		loginScreenShowing = false;
 
 		clientThread.invoke(() ->
 		{
@@ -164,44 +163,45 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 		});
 	}
 
-	@Subscribe
-	public void onGameStateChanged(GameStateChanged event)
+	/**
+	 * Whether the login screen background is on show. LOGGING_IN is included because that is
+	 * still the login screen, just with the loading text over the top of it.
+	 */
+	static boolean showsLoginBackground(GameState state)
 	{
-		GameState state = event.getGameState();
-		switch (state)
-		{
-			case LOGIN_SCREEN:
-			case LOGIN_SCREEN_AUTHENTICATOR:
-				if (!inLoginFlow)
-				{
-					inLoginFlow = true;
-					onLoginScreenShown();
-				}
-				break;
-			case LOGGING_IN:
-				// Still the login screen, just with the loading text over it.
-				break;
-			case LOGGED_IN:
-			case HOPPING:
-				inLoginFlow = false;
-				stopDecoder();
-				restoreBackground();
-				break;
-			default:
-				break;
-		}
+		return state == GameState.LOGIN_SCREEN
+			|| state == GameState.LOGIN_SCREEN_AUTHENTICATOR
+			|| state == GameState.LOGGING_IN;
 	}
 
 	/**
 	 * The render pump. Runs on the client thread once per drawn frame, and does no more than
 	 * wrap an already-decoded array in a sprite.
+	 *
+	 * <p>The login state is read here rather than tracked from GameStateChanged, because
+	 * enabling the plugin while already sitting on the login screen fires no state change at
+	 * all. Waiting for one meant the background never appeared in the most ordinary case
+	 * there is.</p>
 	 */
 	@Subscribe
 	public void onBeforeRender(BeforeRender event)
 	{
-		if (!inLoginFlow)
+		boolean showing = showsLoginBackground(client.getGameState());
+		if (!showing)
 		{
+			if (loginScreenShowing)
+			{
+				loginScreenShowing = false;
+				stopDecoder();
+				restoreBackground();
+			}
 			return;
+		}
+
+		if (!loginScreenShowing)
+		{
+			loginScreenShowing = true;
+			onLoginScreenShown();
 		}
 
 		if (playbackDirty || player == null || canvasHasResized())
