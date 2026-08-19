@@ -14,6 +14,9 @@ public interface LoginScreenGifsConfig extends Config
 	String GROUP = "loginscreengifs";
 	String KEY_CURRENT_GIF = "currentGif";
 	String KEY_SHUFFLE_SEEN = "shuffleSeen";
+	String KEY_CYCLE_TRIGGER = "cycleTrigger";
+	String KEY_CYCLE_SECONDS = "cycleSeconds";
+	String KEY_CYCLE_ORDER = "cycleOrder";
 	String KEY_SCALE_MODE = "scaleMode";
 	String KEY_SHOW_LOGIN_FIRE = "showLoginFire";
 
@@ -32,7 +35,7 @@ public interface LoginScreenGifsConfig extends Config
 	String appearanceSection = "appearance";
 
 	@ConfigItem(
-		keyName = "cycleTrigger",
+		keyName = KEY_CYCLE_TRIGGER,
 		name = "Cycle when",
 		description = "What makes the plugin switch to the next GIF. The side panel and the hotkey can always "
 			+ "cycle by hand, whatever this is set to.",
@@ -47,7 +50,7 @@ public interface LoginScreenGifsConfig extends Config
 	@Range(min = 3, max = 3600)
 	@Units(Units.SECONDS)
 	@ConfigItem(
-		keyName = "cycleSeconds",
+		keyName = KEY_CYCLE_SECONDS,
 		name = "Timer length",
 		description = "How long each GIF is shown, when Cycle when is set to a timer",
 		section = cyclingSection,
@@ -59,7 +62,7 @@ public interface LoginScreenGifsConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "cycleOrder",
+		keyName = KEY_CYCLE_ORDER,
 		name = "Pick order",
 		description = "Which GIF comes next. Shuffle plays every GIF once before any of them repeat.",
 		section = cyclingSection,
@@ -130,6 +133,14 @@ public interface LoginScreenGifsConfig extends Config
 		return "";
 	}
 
+	// Every setter needs its own @ConfigItem: RuneLite reads the key off the method it was
+	// called on, and silently does nothing when the annotation is missing.
+	@ConfigItem(
+		keyName = KEY_CURRENT_GIF,
+		name = "",
+		description = "",
+		hidden = true
+	)
 	void setCurrentGif(String fileName);
 
 	@ConfigItem(
@@ -143,5 +154,44 @@ public interface LoginScreenGifsConfig extends Config
 		return "";
 	}
 
+	@ConfigItem(
+		keyName = KEY_SHUFFLE_SEEN,
+		name = "",
+		description = "",
+		hidden = true
+	)
 	void setShuffleSeen(String seen);
+
+	// Setters behind the side panel controls, so the panel and the settings screen stay in step.
+	@ConfigItem(
+		keyName = KEY_CYCLE_TRIGGER,
+		name = "",
+		description = "",
+		hidden = true
+	)
+	void setCycleTrigger(CycleTrigger trigger);
+
+	@ConfigItem(
+		keyName = KEY_CYCLE_SECONDS,
+		name = "",
+		description = "",
+		hidden = true
+	)
+	void setCycleSeconds(int seconds);
+
+	@ConfigItem(
+		keyName = KEY_CYCLE_ORDER,
+		name = "",
+		description = "",
+		hidden = true
+	)
+	void setCycleOrder(CycleOrder order);
+
+	@ConfigItem(
+		keyName = KEY_SCALE_MODE,
+		name = "",
+		description = "",
+		hidden = true
+	)
+	void setScaleMode(ScaleMode mode);
 }

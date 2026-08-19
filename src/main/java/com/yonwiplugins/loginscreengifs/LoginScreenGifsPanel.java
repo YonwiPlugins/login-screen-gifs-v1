@@ -19,22 +19,28 @@ import java.awt.dnd.DropTargetListener;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferInt;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
+import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JSpinner;
+import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import lombok.extern.slf4j.Slf4j;
@@ -44,15 +50,19 @@ import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.util.LinkBrowser;
 
 /**
- * The side panel: add GIFs, see the library, and change which one is playing without leaving
- * RuneLite. GIFs can arrive by file picker, by dragging them onto the panel, or by being
- * dropped into the folder directly.
+ * The side panel: every setting worth reaching quickly, plus the library itself with a moving
+ * preview of each GIF. GIFs can arrive by file picker, by dragging them onto the panel, or by
+ * being dropped into the folder directly.
  */
 @Slf4j
 class LoginScreenGifsPanel extends PluginPanel
 {
-	private static final int THUMBNAIL_WIDTH = 48;
-	private static final int THUMBNAIL_HEIGHT = 27;
+	private static final int THUMBNAIL_WIDTH = 56;
+	private static final int THUMBNAIL_HEIGHT = 32;
+	/** Enough of a preview to recognise the GIF, without holding a whole animation per row. */
+	private static final int MAX_PREVIEW_FRAMES = 40;
+	private static final int PREVIEW_TICK_MILLIS = 50;
+	private static final int LABEL_WIDTH = 58;
 	private static final Color ROW_SELECTED = ColorScheme.BRAND_ORANGE;
 
 	/** What the panel needs from the plugin. Keeps the panel free of client state. */
@@ -63,6 +73,8 @@ class LoginScreenGifsPanel extends PluginPanel
 		void selectGif(String fileName);
 
 		void cycleBy(int offset);
+
+		LoginScreenGifsConfig getConfig();
 	}
 
 	private final GifLibrary library;
@@ -70,12 +82,24 @@ class LoginScreenGifsPanel extends PluginPanel
 	private final JPanel listPanel = new JPanel();
 	private final JLabel nowPlaying = new JLabel();
 	private final JLabel status = new JLabel();
-	private final ExecutorService thumbnailLoader = Executors.newSingleThreadExecutor(runnable ->
+
+	private final JComboBox<CycleTrigger> triggerBox = new JComboBox<>(CycleTrigger.values());
+	private final JComboBox<CycleOrder> orderBox = new JComboBox<>(CycleOrder.values());
+	private final JComboBox<ScaleMode> scaleBox = new JComboBox<>(ScaleMode.values());
+	private final JSpinner secondsSpinner = new JSpinner(new SpinnerNumberModel(30, 3, 3600, 1));
+	private final JPanel timerRow;
+
+	private final List<Preview> previews = new CopyOnWriteArrayList<>();
+	private final Timer previewTimer = new Timer(PREVIEW_TICK_MILLIS, event -> tickPreviews());
+	private final ExecutorService previewLoader = Executors.newSingleThreadExecutor(runnable ->
 	{
-		Thread thread = new Thread(runnable, "login-screen-gifs-thumbnails");
+		Thread thread = new Thread(runnable, "login-screen-gifs-previews");
 		thread.setDaemon(true);
 		return thread;
 	});
+
+	/** Guards against the control listeners firing while the controls are being populated. */
+	private boolean updatingControls;
 
 	LoginScreenGifsPanel(GifLibrary library, Host host)
 	{
@@ -86,6 +110,7 @@ class LoginScreenGifsPanel extends PluginPanel
 		setBorder(new EmptyBorder(8, 8, 8, 8));
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
 
+		timerRow = labelledRow("Timer", secondsSpinner);
 		add(buildHeader(), BorderLayout.NORTH);
 
 		listPanel.setLayout(new BoxLayout(listPanel, BoxLayout.Y_AXIS));
@@ -95,6 +120,8 @@ class LoginScreenGifsPanel extends PluginPanel
 		// Dropping GIFs anywhere on the panel adds them.
 		setDropTarget(new DropTarget(this, DnDConstants.ACTION_COPY, new GifDropListener(), true));
 
+		previewTimer.setCoalesce(true);
+		refreshControls();
 		reload();
 	}
 
@@ -122,9 +149,29 @@ class LoginScreenGifsPanel extends PluginPanel
 		cycleButtons.add(button("Next >", "Play the next GIF", () -> host.cycleBy(1)));
 		header.add(cycleButtons);
 
+		header.add(sectionLabel("Cycling"));
+		header.add(labelledRow("Change", triggerBox));
+		header.add(labelledRow("Order", orderBox));
+		header.add(timerRow);
+		header.add(labelledRow("Sizing", scaleBox));
+
+		triggerBox.setToolTipText("What makes the plugin switch to the next GIF");
+		orderBox.setToolTipText("Which GIF comes next");
+		scaleBox.setToolTipText("How each frame is fitted to the login screen");
+		secondsSpinner.setToolTipText("Seconds each GIF is shown when Change is set to a timer");
+
+		triggerBox.addActionListener(event -> onControlChanged(() ->
+			host.getConfig().setCycleTrigger((CycleTrigger) triggerBox.getSelectedItem())));
+		orderBox.addActionListener(event -> onControlChanged(() ->
+			host.getConfig().setCycleOrder((CycleOrder) orderBox.getSelectedItem())));
+		scaleBox.addActionListener(event -> onControlChanged(() ->
+			host.getConfig().setScaleMode((ScaleMode) scaleBox.getSelectedItem())));
+		secondsSpinner.addChangeListener(event -> onControlChanged(() ->
+			host.getConfig().setCycleSeconds((Integer) secondsSpinner.getValue())));
+
+		header.add(sectionLabel("Library"));
 		JPanel fileButtons = new JPanel(new GridLayout(1, 2, 4, 0));
 		fileButtons.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		fileButtons.setBorder(new EmptyBorder(4, 0, 0, 0));
 		fileButtons.add(button("Add GIFs", "Pick GIFs to copy into the library", this::chooseFiles));
 		fileButtons.add(button("Folder", "Open the GIF folder", this::openFolder));
 		header.add(fileButtons);
@@ -132,10 +179,39 @@ class LoginScreenGifsPanel extends PluginPanel
 		status.setFont(FontManager.getRunescapeSmallFont());
 		status.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 		status.setAlignmentX(Component.CENTER_ALIGNMENT);
-		status.setBorder(new EmptyBorder(6, 0, 0, 0));
+		status.setBorder(new EmptyBorder(6, 0, 2, 0));
 		header.add(status);
 
 		return header;
+	}
+
+	private JLabel sectionLabel(String text)
+	{
+		JLabel label = new JLabel(text);
+		label.setFont(FontManager.getRunescapeSmallFont());
+		label.setForeground(ColorScheme.BRAND_ORANGE);
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		label.setBorder(new EmptyBorder(10, 0, 4, 0));
+		return label;
+	}
+
+	/** A fixed-width caption with the control filling whatever is left. */
+	private JPanel labelledRow(String text, JComponent field)
+	{
+		JPanel row = new JPanel(new BorderLayout(4, 0));
+		row.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		row.setBorder(new EmptyBorder(0, 0, 3, 0));
+		row.setMaximumSize(new Dimension(PANEL_WIDTH, 26));
+
+		JLabel caption = new JLabel(text);
+		caption.setFont(FontManager.getRunescapeSmallFont());
+		caption.setForeground(ColorScheme.TEXT_COLOR);
+		caption.setPreferredSize(new Dimension(LABEL_WIDTH, 22));
+		row.add(caption, BorderLayout.WEST);
+
+		field.setFont(FontManager.getRunescapeSmallFont());
+		row.add(field, BorderLayout.CENTER);
+		return row;
 	}
 
 	private JButton button(String text, String tooltip, Runnable action)
@@ -145,6 +221,42 @@ class LoginScreenGifsPanel extends PluginPanel
 		button.setFocusPainted(false);
 		button.addActionListener(event -> action.run());
 		return button;
+	}
+
+	private void onControlChanged(Runnable write)
+	{
+		if (updatingControls)
+		{
+			return;
+		}
+		write.run();
+		refreshControls();
+	}
+
+	/** Pulls the controls back in step with the config, wherever it was changed. */
+	void refreshControls()
+	{
+		if (!SwingUtilities.isEventDispatchThread())
+		{
+			SwingUtilities.invokeLater(this::refreshControls);
+			return;
+		}
+
+		LoginScreenGifsConfig config = host.getConfig();
+		updatingControls = true;
+		try
+		{
+			triggerBox.setSelectedItem(config.cycleTrigger());
+			orderBox.setSelectedItem(config.cycleOrder());
+			scaleBox.setSelectedItem(config.scaleMode());
+			secondsSpinner.setValue(config.cycleSeconds());
+			// The timer length only means anything for the timed trigger.
+			timerRow.setVisible(config.cycleTrigger() == CycleTrigger.TIMER);
+		}
+		finally
+		{
+			updatingControls = false;
+		}
 	}
 
 	/**
@@ -159,6 +271,7 @@ class LoginScreenGifsPanel extends PluginPanel
 		}
 
 		List<File> files = library.list();
+		previews.clear();
 		listPanel.removeAll();
 
 		if (files.isEmpty())
@@ -177,6 +290,7 @@ class LoginScreenGifsPanel extends PluginPanel
 		refreshNowPlaying(files.size());
 		listPanel.revalidate();
 		listPanel.repaint();
+		updateTimerState();
 	}
 
 	private JLabel emptyState()
@@ -210,8 +324,9 @@ class LoginScreenGifsPanel extends PluginPanel
 
 		JLabel thumbnail = new JLabel();
 		thumbnail.setPreferredSize(new Dimension(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT));
+		thumbnail.setHorizontalAlignment(SwingConstants.CENTER);
 		row.add(thumbnail, BorderLayout.WEST);
-		loadThumbnail(file, thumbnail);
+		loadPreview(file, thumbnail);
 
 		JLabel name = new JLabel(shorten(file.getName()));
 		name.setFont(FontManager.getRunescapeSmallFont());
@@ -268,7 +383,10 @@ class LoginScreenGifsPanel extends PluginPanel
 
 		if (library.remove(file.getName()))
 		{
-			host.selectGif(null);
+			if (file.getName().equalsIgnoreCase(host.getCurrentGifName()))
+			{
+				host.selectGif(null);
+			}
 		}
 		else
 		{
@@ -341,52 +459,115 @@ class LoginScreenGifsPanel extends PluginPanel
 		}
 	}
 
-	private void loadThumbnail(File file, JLabel target)
+	/**
+	 * Builds a moving preview on a background thread. The plugin decoder is used rather than the
+	 * one in the JRE, so previews appear for every GIF the login screen can actually play.
+	 */
+	private void loadPreview(File file, JLabel target)
 	{
-		thumbnailLoader.submit(() ->
+		previewLoader.submit(() ->
 		{
-			BufferedImage thumbnail = readThumbnail(file);
-			if (thumbnail != null)
+			Preview preview = decodePreview(file, target);
+			if (preview == null)
 			{
-				SwingUtilities.invokeLater(() -> target.setIcon(new ImageIcon(thumbnail)));
+				return;
 			}
+
+			SwingUtilities.invokeLater(() ->
+			{
+				target.setIcon(preview.frames.get(0));
+				previews.add(preview);
+				updateTimerState();
+			});
 		});
 	}
 
-	/** Reads the first frame only, which is enough to recognise a GIF at this size. */
-	private static BufferedImage readThumbnail(File file)
+	private static Preview decodePreview(File file, JLabel target)
 	{
-		try
+		try (GifDecoder decoder = GifDecoder.open(file))
 		{
-			BufferedImage source;
-			synchronized (ImageIO.class)
+			List<ImageIcon> frames = new ArrayList<>();
+			List<Long> durations = new ArrayList<>();
+
+			GifDecoder.Frame frame;
+			while (frames.size() < MAX_PREVIEW_FRAMES && (frame = decoder.nextFrame()) != null)
 			{
-				source = ImageIO.read(file);
-			}
-			if (source == null)
-			{
-				return null;
+				frames.add(new ImageIcon(scale(frame.getArgb(), decoder.getWidth(), decoder.getHeight())));
+				durations.add(Math.max(20L, frame.getDurationMillis()));
 			}
 
-			BufferedImage scaled = new BufferedImage(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, BufferedImage.TYPE_INT_RGB);
-			Graphics2D graphics = scaled.createGraphics();
-			try
-			{
-				graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-					RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-				graphics.drawImage(source, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, null);
-			}
-			finally
-			{
-				graphics.dispose();
-			}
-			return scaled;
+			return frames.isEmpty() ? null : new Preview(target, frames, durations);
 		}
 		catch (Exception ex)
 		{
-			log.debug("Could not build a thumbnail for {}", file, ex);
+			log.debug("Could not build a preview for {}", file, ex);
 			return null;
 		}
+	}
+
+	private static BufferedImage scale(int[] argb, int sourceWidth, int sourceHeight)
+	{
+		BufferedImage source = new BufferedImage(sourceWidth, sourceHeight, BufferedImage.TYPE_INT_RGB);
+		int[] pixels = ((DataBufferInt) source.getRaster().getDataBuffer()).getData();
+		System.arraycopy(argb, 0, pixels, 0, Math.min(argb.length, pixels.length));
+
+		BufferedImage scaled = new BufferedImage(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, BufferedImage.TYPE_INT_RGB);
+		Graphics2D graphics = scaled.createGraphics();
+		try
+		{
+			graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+			// Fitted rather than cropped, so a tall GIF is still recognisable at this size.
+			double scale = Math.min(
+				(double) THUMBNAIL_WIDTH / sourceWidth,
+				(double) THUMBNAIL_HEIGHT / sourceHeight);
+			int width = Math.max(1, (int) Math.round(sourceWidth * scale));
+			int height = Math.max(1, (int) Math.round(sourceHeight * scale));
+			graphics.drawImage(source, (THUMBNAIL_WIDTH - width) / 2, (THUMBNAIL_HEIGHT - height) / 2,
+				width, height, null);
+		}
+		finally
+		{
+			graphics.dispose();
+		}
+		return scaled;
+	}
+
+	private void tickPreviews()
+	{
+		for (Preview preview : previews)
+		{
+			preview.advance(PREVIEW_TICK_MILLIS);
+		}
+	}
+
+	private void updateTimerState()
+	{
+		boolean wanted = isShowing() && previews.stream().anyMatch(Preview::isAnimated);
+		if (wanted && !previewTimer.isRunning())
+		{
+			previewTimer.start();
+		}
+		else if (!wanted && previewTimer.isRunning())
+		{
+			previewTimer.stop();
+		}
+	}
+
+	@Override
+	public void onActivate()
+	{
+		super.onActivate();
+		reload();
+		refreshControls();
+		updateTimerState();
+	}
+
+	@Override
+	public void onDeactivate()
+	{
+		super.onDeactivate();
+		// Nothing is on screen to animate, so stop burning cycles on it.
+		previewTimer.stop();
 	}
 
 	private void showError(String message)
@@ -408,7 +589,53 @@ class LoginScreenGifsPanel extends PluginPanel
 
 	void shutDown()
 	{
-		thumbnailLoader.shutdownNow();
+		previewTimer.stop();
+		previewLoader.shutdownNow();
+		previews.clear();
+	}
+
+	/** One row's animation: the decoded frames and where it has got to. */
+	private static final class Preview
+	{
+		private final JLabel target;
+		private final List<ImageIcon> frames;
+		private final List<Long> durations;
+		private int index;
+		private long elapsed;
+
+		private Preview(JLabel target, List<ImageIcon> frames, List<Long> durations)
+		{
+			this.target = target;
+			this.frames = frames;
+			this.durations = durations;
+		}
+
+		private boolean isAnimated()
+		{
+			return frames.size() > 1;
+		}
+
+		/** Holds each frame for its own delay rather than a flat rate. */
+		private void advance(long deltaMillis)
+		{
+			if (!isAnimated())
+			{
+				return;
+			}
+
+			elapsed += deltaMillis;
+			boolean moved = false;
+			while (elapsed >= durations.get(index))
+			{
+				elapsed -= durations.get(index);
+				index = (index + 1) % frames.size();
+				moved = true;
+			}
+			if (moved)
+			{
+				target.setIcon(frames.get(index));
+			}
+		}
 	}
 
 	/**

@@ -42,7 +42,8 @@ import net.runelite.client.ui.NavigationButton;
 @Slf4j
 public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginScreenGifsPanel.Host
 {
-	/** Login index 4 is the authenticator form, per the client API. */
+	/** Login index 2 is the username and password form, 4 the authenticator, per the client API. */
+	private static final int LOGIN_INDEX_FORM = 2;
 	private static final int LOGIN_INDEX_AUTHENTICATOR = 4;
 	/**
 	 * How long the current frame is held after a click or a keystroke. The login screen serves
@@ -92,7 +93,11 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 
 	private volatile String currentGifName;
 	private volatile boolean playbackDirty;
-	private volatile long holdUntilNanos;
+	/** Long.MIN_VALUE rather than 0, because nanoTime is allowed to be negative. */
+	private volatile long holdUntilNanos = Long.MIN_VALUE;
+
+	private int baseLoginIndex = -1;
+	private int lastSeenLoginIndex = -1;
 
 	private boolean backgroundApplied;
 	private boolean loginScreenShowing;
@@ -271,6 +276,19 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 		{
 			resetCycleTimer();
 		}
+
+		// The settings screen and the side panel edit the same values, so keep them in step.
+		LoginScreenGifsPanel current = panel;
+		if (current != null)
+		{
+			current.refreshControls();
+		}
+	}
+
+	@Override
+	public LoginScreenGifsConfig getConfig()
+	{
+		return config;
 	}
 
 	/**
@@ -280,8 +298,24 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 	 */
 	private boolean isHoldingFrame(long now)
 	{
+		int loginIndex = client.getLoginIndex();
+		if (loginIndex != lastSeenLoginIndex)
+		{
+			lastSeenLoginIndex = loginIndex;
+			log.debug("Login screen index is now {} (base {})", loginIndex, baseLoginIndex);
+		}
+
 		if (client.getGameState() == GameState.LOGIN_SCREEN_AUTHENTICATOR
-			|| client.getLoginIndex() == LOGIN_INDEX_AUTHENTICATOR)
+			|| loginIndex == LOGIN_INDEX_AUTHENTICATOR)
+		{
+			return true;
+		}
+
+		// Anything that is not the plain background or the username and password form is a
+		// screen in its own right: the world switcher, an error dialog, the authenticator. Those
+		// serve their own clicks on the client thread, so hold the frame instead of competing
+		// with them. Unknown screens hold too, which is the safe way round.
+		if (baseLoginIndex >= 0 && loginIndex != baseLoginIndex && loginIndex != LOGIN_INDEX_FORM)
 		{
 			return true;
 		}
@@ -296,6 +330,11 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 
 	private void onLoginScreenShown()
 	{
+		// Whatever screen the client lands on is the plain one; anything else is a sub-screen.
+		baseLoginIndex = client.getLoginIndex();
+		lastSeenLoginIndex = baseLoginIndex;
+		log.debug("Login screen shown at index {}", baseLoginIndex);
+
 		if (config.cycleTrigger() == CycleTrigger.LOGIN_SCREEN)
 		{
 			advance();

@@ -9,9 +9,30 @@ screen, with a side panel for managing the whole library without leaving the cli
   `.gif` files are in the folder.
 - **Upload from the side panel.** Drag GIFs onto the panel, pick them with a file chooser, or
   open the folder and drop them in. No file-fiddling elsewhere.
+- **Moving previews.** Every GIF in the library animates in its own row, so you can tell them
+  apart at a glance.
+- **Every control in the panel.** Cycling, order, timer and sizing sit next to the library, and
+  stay in step with the settings screen.
 - **As many GIFs as you like.** The library is unbounded; cycle through as many as you can be
   bothered to collect.
 - **No fallback FPS setting.** Frame timing is worked out from the GIF itself.
+- **Plays GIFs Java itself cannot read.** See below.
+
+## Its own GIF reader
+
+The GIF reader in the JRE throws `ArrayIndexOutOfBoundsException: Index 4096 out of bounds for
+length 4096` on a good number of perfectly valid GIFs. 4096 is the ceiling of the LZW
+dictionary, and its decoder walks off the end of its own string table when a stream fills the
+dictionary without first sending a clear code — which is exactly what the encoders behind Giphy,
+Tenor and ffmpeg tend to produce.
+
+The symptom is a GIF that shows as a still image, or does not appear at all. Of eight ordinary
+GIFs tested here, one yielded no frames and another stopped after three and looped those
+forever.
+
+So this plugin parses the format itself, holding the dictionary at the ceiling rather than
+growing past it. It reads the file as a stream, so a large GIF never sits on the heap, and it
+needs no third-party dependency.
 
 ## Using it
 
