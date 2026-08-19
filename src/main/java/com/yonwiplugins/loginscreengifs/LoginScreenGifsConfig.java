@@ -112,14 +112,29 @@ public interface LoginScreenGifsConfig extends Config
 	@ConfigItem(
 		keyName = "pauseWhileInteracting",
 		name = "Pause while you interact",
-		description = "Holds the current frame for a moment after you click or type, so the world switcher and "
-			+ "the authenticator screen stay responsive. Leave this on unless you are sure you do not need it.",
+		description = "Freezes the GIF while you are using the login screen, so the world switcher and the "
+			+ "authenticator get the client to themselves. Leave this on unless you are sure you do not need it.",
 		section = appearanceSection,
 		position = 2
 	)
 	default boolean pauseWhileInteracting()
 	{
 		return true;
+	}
+
+	@Range(min = 1, max = 30)
+	@Units(Units.SECONDS)
+	@ConfigItem(
+		keyName = "interactionPauseSeconds",
+		name = "Resume after",
+		description = "How long the GIF stays frozen once you stop moving the mouse and typing. Raise this if "
+			+ "the world switcher still misbehaves while you are browsing worlds.",
+		section = appearanceSection,
+		position = 3
+	)
+	default int interactionPauseSeconds()
+	{
+		return 3;
 	}
 
 	@ConfigItem(

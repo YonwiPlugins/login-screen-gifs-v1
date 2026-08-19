@@ -45,12 +45,6 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 	/** Login index 2 is the username and password form, 4 the authenticator, per the client API. */
 	private static final int LOGIN_INDEX_FORM = 2;
 	private static final int LOGIN_INDEX_AUTHENTICATOR = 4;
-	/**
-	 * How long the current frame is held after a click or a keystroke. The login screen serves
-	 * its own clicks and key input on the client thread, so leaving that thread alone for a
-	 * moment is what keeps the world switcher and the authenticator responsive.
-	 */
-	private static final long INTERACTION_HOLD_MILLIS = 500L;
 	/** The stock login screen size; anything smaller is not worth rendering. */
 	private static final int MIN_WIDTH = 765;
 	private static final int MIN_HEIGHT = 503;
@@ -100,14 +94,49 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 	private int lastSeenLoginIndex = -1;
 
 	private boolean backgroundApplied;
+	private boolean wasHolding;
 	private boolean loginScreenShowing;
 	private long nextFrameAtNanos;
 	private long cycleDueAtNanos;
 
+	/**
+	 * Any sign of life on the login screen freezes the GIF. Movement counts, not just clicks:
+	 * the login index does not change when the world switcher opens, so there is nothing to
+	 * detect it by, and browsing a world list is minutes of mouse movement with only the odd
+	 * click. Freezing on movement covers the whole time the screen is in use.
+	 */
 	private final MouseAdapter mouseAdapter = new MouseAdapter()
 	{
 		@Override
 		public MouseEvent mousePressed(MouseEvent event)
+		{
+			holdFrame();
+			return event;
+		}
+
+		@Override
+		public MouseEvent mouseReleased(MouseEvent event)
+		{
+			holdFrame();
+			return event;
+		}
+
+		@Override
+		public MouseEvent mouseMoved(MouseEvent event)
+		{
+			holdFrame();
+			return event;
+		}
+
+		@Override
+		public MouseEvent mouseDragged(MouseEvent event)
+		{
+			holdFrame();
+			return event;
+		}
+
+		@Override
+		public MouseEvent mouseEntered(MouseEvent event)
 		{
 			holdFrame();
 			return event;
@@ -219,13 +248,20 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 		}
 
 		long now = System.nanoTime();
+
+		// Checked before the timer, so a GIF does not change under you mid-interaction either.
+		if (isHoldingFrame(now))
+		{
+			return;
+		}
+
 		if (config.cycleTrigger() == CycleTrigger.TIMER && cycleDueAtNanos > 0L && now >= cycleDueAtNanos)
 		{
 			advance();
 			return;
 		}
 
-		if (isHoldingFrame(now) || (backgroundApplied && now < nextFrameAtNanos))
+		if (backgroundApplied && now < nextFrameAtNanos)
 		{
 			return;
 		}
@@ -298,6 +334,17 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 	 */
 	private boolean isHoldingFrame(long now)
 	{
+		boolean holding = shouldHoldFrame(now);
+		if (holding != wasHolding)
+		{
+			wasHolding = holding;
+			log.debug("GIF {} (login index {})", holding ? "frozen" : "resumed", client.getLoginIndex());
+		}
+		return holding;
+	}
+
+	private boolean shouldHoldFrame(long now)
+	{
 		int loginIndex = client.getLoginIndex();
 		if (loginIndex != lastSeenLoginIndex)
 		{
@@ -311,10 +358,10 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 			return true;
 		}
 
-		// Anything that is not the plain background or the username and password form is a
-		// screen in its own right: the world switcher, an error dialog, the authenticator. Those
-		// serve their own clicks on the client thread, so hold the frame instead of competing
-		// with them. Unknown screens hold too, which is the safe way round.
+		// Any sub-screen the login index does report -- an error dialog, the authenticator --
+		// gets left alone. The world switcher is not one of them: the index stays put when it
+		// opens, so there is nothing to detect it by, and the idle freeze below is what covers
+		// it instead.
 		if (baseLoginIndex >= 0 && loginIndex != baseLoginIndex && loginIndex != LOGIN_INDEX_FORM)
 		{
 			return true;
@@ -325,7 +372,8 @@ public class LoginScreenGifsPlugin extends Plugin implements KeyListener, LoginS
 
 	private void holdFrame()
 	{
-		holdUntilNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(INTERACTION_HOLD_MILLIS);
+		holdUntilNanos = System.nanoTime()
+			+ TimeUnit.SECONDS.toNanos(Math.max(1, config.interactionPauseSeconds()));
 	}
 
 	private void onLoginScreenShown()
